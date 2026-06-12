@@ -74,4 +74,79 @@ export function upsertClient(name: string, tin?: string, type = "horeca", phone?
 }
 
 export function getClient(nameOrTin: string) {
-  return db.prepare("SELECT * FROM clients WHERE tin = ? OR LOWER(name) LIKE LOWER(?)").get(nameOrTin, `
+  return db.prepare("SELECT * FROM clients WHERE tin = ? OR LOWER(name) LIKE LOWER(?)").get(nameOrTin, `%${nameOrTin}%`) as any;
+}
+
+export function listClients() {
+  return db.prepare("SELECT * FROM clients ORDER BY name").all() as any[];
+}
+
+export function addInvoice(clientId: number, date: string, items: any[], totalGel: number, rsWaybillId?: string, notes?: string) {
+  const r = db.prepare("INSERT INTO invoices (client_id, date, items, total_gel, rs_waybill_id, notes) VALUES (?,?,?,?,?,?)").run(clientId, date, JSON.stringify(items), totalGel, rsWaybillId || null, notes || null);
+  return db.prepare("SELECT * FROM invoices WHERE id = ?").get(r.lastInsertRowid) as any;
+}
+
+export function getClientInvoices(clientId: number, dateFrom?: string, dateTo?: string) {
+  let sql = "SELECT * FROM invoices WHERE client_id = ?";
+  const params: any[] = [clientId];
+  if (dateFrom) { sql += " AND date >= ?"; params.push(dateFrom); }
+  if (dateTo) { sql += " AND date <= ?"; params.push(dateTo); }
+  return db.prepare(sql + " ORDER BY date DESC").all(...params) as any[];
+}
+
+export function addPayment(clientId: number, amountGel: number, date: string, method = "transfer", notes?: string) {
+  const r = db.prepare("INSERT INTO payments (client_id, amount_gel, date, method, notes) VALUES (?,?,?,?,?)").run(clientId, amountGel, date, method, notes || null);
+  return db.prepare("SELECT * FROM payments WHERE id = ?").get(r.lastInsertRowid) as any;
+}
+
+export function getClientPayments(clientId: number, dateFrom?: string, dateTo?: string) {
+  let sql = "SELECT * FROM payments WHERE client_id = ?";
+  const params: any[] = [clientId];
+  if (dateFrom) { sql += " AND date >= ?"; params.push(dateFrom); }
+  if (dateTo) { sql += " AND date <= ?"; params.push(dateTo); }
+  return db.prepare(sql + " ORDER BY date DESC").all(...params) as any[];
+}
+
+export function getClientBalance(clientId: number) {
+  const invoiced = (db.prepare("SELECT COALESCE(SUM(total_gel),0) as t FROM invoices WHERE client_id = ? AND status != 'cancelled'").get(clientId) as any).t;
+  const paid = (db.prepare("SELECT COALESCE(SUM(amount_gel),0) as t FROM payments WHERE client_id = ?").get(clientId) as any).t;
+  return { invoiced, paid, balance: invoiced - paid };
+}
+
+export function getRevenueReport(dateFrom: string, dateTo: string) {
+  const revenue = (db.prepare("SELECT COALESCE(SUM(total_gel),0) as t FROM invoices WHERE date >= ? AND date <= ? AND status != 'cancelled'").get(dateFrom, dateTo) as any).t;
+  const payments = (db.prepare("SELECT COALESCE(SUM(amount_gel),0) as t FROM payments WHERE date >= ? AND date <= ?").get(dateFrom, dateTo) as any).t;
+  const rows = db.prepare("SELECT items FROM invoices WHERE date >= ? AND date <= ? AND status != 'cancelled'").all(dateFrom, dateTo) as any[];
+  let totalLotki = 0;
+  for (const row of rows) { try { for (const i of JSON.parse(row.items)) totalLotki += i.quantity || 0; } catch {} }
+  return { revenue, payments, totalLotki, dateFrom, dateTo };
+}
+
+export function getAllBalances() {
+  return listClients().map(c => ({ ...c, ...getClientBalance(c.id) })).filter(c => c.invoiced > 0 || c.paid > 0);
+}
+
+export function addExpense(date: string, category: string, description: string, amountGel: number, notes?: string) {
+  const r = db.prepare("INSERT INTO expenses (date, category, description, amount_gel, notes) VALUES (?,?,?,?,?)").run(date, category, description, amountGel, notes || null);
+  return db.prepare("SELECT * FROM expenses WHERE id = ?").get(r.lastInsertRowid) as any;
+}
+
+export function getExpenses(dateFrom?: string, dateTo?: string) {
+  let sql = "SELECT * FROM expenses WHERE 1=1";
+  const params: any[] = [];
+  if (dateFrom) { sql += " AND date >= ?"; params.push(dateFrom); }
+  if (dateTo) { sql += " AND date <= ?"; params.push(dateTo); }
+  return db.prepare(sql + " ORDER BY date DESC").all(...params) as any[];
+}
+
+export function calculatePartnerSettlement(dateFrom: string, dateTo: string, nataliaSharePct = 50) {
+  const { revenue } = getRevenueReport(dateFrom, dateTo);
+  const expenses = (db.prepare("SELECT COALESCE(SUM(amount_gel),0) as t FROM expenses WHERE date >= ? AND date <= ?").get(dateFrom, dateTo) as any).t;
+  const net = revenue - expenses;
+  return { period: `${dateFrom} — ${dateTo}`, grossRevenue: revenue, expenses, netProfit: net, nataliaSharePct, nataliaShare: net * nataliaSharePct / 100, sergeiShare: net * (100 - nataliaSharePct) / 100 };
+}
+
+  
+    
+  
+ 
