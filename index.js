@@ -193,9 +193,9 @@ server.setRequestHandler(CallToolRequestSchema, async(request)=>{
   }
 });
 
-async function main() {
-  const transport = new StdioServerTransport();
-  await server.connect(transport);
-  console.error("✅ Microzelen MCP Server запущен");
-}
-main().catch(console.error);
+const http = require("http");
+const PORT = process.env.PORT || 3000;
+http.createServer((req, res) => {
+  res.writeHead(200, {"Content-Type":"text/plain"});
+  res.end("Microzelen MCP Server OK");
+}).listen(PORT, () => console.error(`Server on port ${PORT}`));
