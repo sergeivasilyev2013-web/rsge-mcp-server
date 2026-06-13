@@ -1,114 +1,158 @@
-import { Server } from "@modelcontextprotocol/sdk/server/index.js";
-import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
-import { upsertClient, getClient, listClients, addInvoice, getClientInvoices, addPayment, getClientPayments, getClientBalance, getRevenueReport, getAllBalances, addExpense, calculatePartnerSettlement } from "./db.js";
-import { rsCreateWaybill, rsLookupTin } from "./rsge.js";
+import Database from "better-sqlite3";
+import path from "path";
+import fs from "fs";
 
-function today() { return new Date().toISOString().split("T")[0]; }
-function formatBalance(bal: { invoiced: number; paid: number; balance: number }) {
-  if (bal.balance > 0) return `Долг: ${bal.balance.toFixed(2)} GEL`;
-  if (bal.balance < 0) return `Переплата: ${Math.abs(bal.balance).toFixed(2)} GEL`;
-  return "Расчёт закрыт ✅";
-}
+const DB_PATH = process.env.DB_PATH || path.join(process.cwd(), "data", "microzelen.db");
+const dbDir = path.dirname(DB_PATH);
+if (!fs.existsSync(dbDir)) fs.mkdirSync(dbDir, { recursive: true });
 
-const server = new Server({ name: "rsge-microzelen", version: "2.0.0" }, { capabilities: { tools: {} } });
+export const db = new Database(DB_PATH);
+db.pragma("journal_mode = WAL");
+db.pragma("foreign_keys = ON");
 
-server.setRequestHandler(ListToolsRequestSchema, async () => ({
-  tools: [
-    { name: "add_client", description: "Добавить клиента", inputSchema: { type: "object", properties: { name: { type: "string" }, tin: { type: "string" }, type: { type: "string", enum: ["horeca","private","wholesale"] }, phone: { type: "string" } }, required: ["name"] } },
-    { name: "list_clients", description: "Список всех клиентов с балансами", inputSchema: { type: "object", properties: {} } },
-    { name: "create_invoice", description: "Создать накладную клиенту на микрозелень и отправить в rs.ge", inputSchema: { type: "object", properties: { client_name: { type: "string" }, items: { type: "array", items: { type: "object", properties: { name: { type: "string" }, quantity: { type: "number" }, price: { type: "number" } }, required: ["name","quantity","price"] } }, date: { type: "string" }, notes: { type: "string" } }, required: ["client_name","items"] } },
-    { name: "get_client_invoices", description: "Накладные клиента за период", inputSchema: { type: "object", properties: { client_name: { type: "string" }, date_from: { type: "string" }, date_to: { type: "string" } }, required: ["client_name"] } },
-    { name: "record_payment", description: "Записать оплату от клиента", inputSchema: { type: "object", properties: { client_name: { type: "string" }, amount_gel: { type: "number" }, date: { type: "string" }, method: { type: "string", enum: ["transfer","cash","card"] }, notes: { type: "string" } }, required: ["client_name","amount_gel"] } },
-    { name: "get_client_balance", description: "Баланс и акт сверки клиента", inputSchema: { type: "object", properties: { client_name: { type: "string" }, date_from: { type: "string" }, date_to: { type: "string" } }, required: ["client_name"] } },
-    { name: "get_all_balances", description: "Долги всех клиентов", inputSchema: { type: "object", properties: {} } },
-    { name: "revenue_report", description: "Выручка за период", inputSchema: { type: "object", properties: { date_from: { type: "string" }, date_to: { type: "string" } }, required: ["date_from","date_to"] } },
-    { name: "add_expense", description: "Записать расход", inputSchema: { type: "object", properties: { description: { type: "string" }, amount_gel: { type: "number" }, category: { type: "string", enum: ["seeds","substrate","packaging","delivery","other"] }, date: { type: "string" } }, required: ["description","amount_gel","category"] } },
-    { name: "partner_settlement", description: "Расчёт с Натальей Шевченко", inputSchema: { type: "object", properties: { date_from: { type: "string" }, date_to: { type: "string" }, natalia_share_pct: { type: "number" } }, required: ["date_from","date_to"] } },
-    { name: "tax_monthly", description: "Налог за месяц (1% малый бизнес)", inputSchema: { type: "object", properties: { year: { type: "number" }, month: { type: "number" } }, required: ["year","month"] } },
-    { name: "lookup_tin", description: "Найти компанию по ИНН в rs.ge", inputSchema: { type: "object", properties: { tin: { type: "string" } }, required: ["tin"] } },
-  ]
-}));
+db.exec(`
+  CREATE TABLE IF NOT EXISTS clients (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    tin TEXT UNIQUE,
+    type TEXT NOT NULL DEFAULT 'horeca',
+    phone TEXT,
+    notes TEXT,
+    created_at TEXT DEFAULT (datetime('now'))
+  );
+  CREATE TABLE IF NOT EXISTS invoices (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    rs_waybill_id TEXT,
+    client_id INTEGER NOT NULL REFERENCES clients(id),
+    date TEXT NOT NULL,
+    items TEXT NOT NULL,
+    total_gel REAL NOT NULL,
+    status TEXT DEFAULT 'active',
+    notes TEXT,
+    created_at TEXT DEFAULT (datetime('now'))
+  );
+  CREATE TABLE IF NOT EXISTS payments (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    client_id INTEGER NOT NULL REFERENCES clients(id),
+    amount_gel REAL NOT NULL,
+    date TEXT NOT NULL,
+    method TEXT DEFAULT 'transfer',
+    notes TEXT,
+    created_at TEXT DEFAULT (datetime('now'))
+  );
+  CREATE TABLE IF NOT EXISTS expenses (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    date TEXT NOT NULL,
+    category TEXT NOT NULL,
+    description TEXT NOT NULL,
+    amount_gel REAL NOT NULL,
+    notes TEXT,
+    created_at TEXT DEFAULT (datetime('now'))
+  );
+  CREATE TABLE IF NOT EXISTS tax_filings (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    year INTEGER NOT NULL,
+    month INTEGER,
+    type TEXT NOT NULL,
+    turnover REAL,
+    tax_paid REAL,
+    filed_at TEXT DEFAULT (datetime('now')),
+    notes TEXT
+  );
+`);
 
-server.setRequestHandler(CallToolRequestSchema, async (request) => {
-  const { name, arguments: rawArgs } = request.params;
-  const a = (rawArgs || {}) as Record<string, any>;
-  try {
-    let result: any;
-    if (name === "add_client") {
-      const c = upsertClient(a.name, a.tin, a.type || "horeca", a.phone);
-      result = { success: true, client: c, message: `✅ Клиент "${a.name}" добавлен` };
-    } else if (name === "list_clients") {
-      const clients = listClients().map(c => ({ ...c, ...getClientBalance(c.id), balanceStr: formatBalance(getClientBalance(c.id)) }));
-      result = { clients, total: clients.length };
-    } else if (name === "create_invoice") {
-      const client = getClient(a.client_name);
-      if (!client) throw new Error(`Клиент "${a.client_name}" не найден`);
-      const total = a.items.reduce((s: number, i: any) => s + i.quantity * i.price, 0);
-      const date = a.date || today();
-      let rsId: string | undefined;
-      if (process.env.RS_SERVICE_USER && process.env.RS_SERVICE_PASSWORD && client.tin) {
-        try { rsId = await rsCreateWaybill(client.tin, client.name, a.items, date); } catch (e: any) { console.error("rs.ge:", e.message); }
-      }
-      const inv = addInvoice(client.id, date, a.items, total, rsId, a.notes);
-      const bal = getClientBalance(client.id);
-      result = { success: true, invoice_id: inv.id, rs_waybill_id: rsId || "без rs.ge", client: client.name, total_gel: total, date, balance: formatBalance(bal), message: `✅ Накладная #${inv.id} создана. Сумма: ${total} GEL. ${formatBalance(bal)}` };
-    } else if (name === "get_client_invoices") {
-      const client = getClient(a.client_name);
-      if (!client) throw new Error(`Клиент "${a.client_name}" не найден`);
-      result = { client: client.name, invoices: getClientInvoices(client.id, a.date_from, a.date_to) };
-    } else if (name === "record_payment") {
-      const client = getClient(a.client_name);
-      if (!client) throw new Error(`Клиент "${a.client_name}" не найден`);
-      const p = addPayment(client.id, a.amount_gel, a.date || today(), a.method || "transfer", a.notes);
-      const bal = getClientBalance(client.id);
-      result = { success: true, payment_id: p.id, client: client.name, amount: a.amount_gel, balance: formatBalance(bal), message: `✅ Оплата ${a.amount_gel} GEL от "${client.name}" записана. ${formatBalance(bal)}` };
-    } else if (name === "get_client_balance") {
-      const client = getClient(a.client_name);
-      if (!client) throw new Error(`Клиент "${a.client_name}" не найден`);
-      const bal = getClientBalance(client.id);
-      const invoices = getClientInvoices(client.id, a.date_from, a.date_to);
-      const payments = getClientPayments(client.id, a.date_from, a.date_to);
-      const lines = [`📋 АКТ СВЕРКИ — ${client.name}`, `${"─".repeat(40)}`, `НАКЛАДНЫЕ:`, ...invoices.map((i: any) => `  ${i.date}  #${i.id}  ${i.total_gel} GEL`), `Итого выставлено: ${bal.invoiced.toFixed(2)} GEL`, ``, `ОПЛАТЫ:`, ...payments.map((p: any) => `  ${p.date}  ${p.amount_gel} GEL`), `Итого оплачено: ${bal.paid.toFixed(2)} GEL`, `${"─".repeat(40)}`, `БАЛАНС: ${formatBalance(bal)}`];
-      result = { client: client.name, balance: bal, balanceStr: formatBalance(bal), reconciliation: lines.join("\n") };
-    } else if (name === "get_all_balances") {
-      const all = getAllBalances();
-      const totalDebt = all.filter(c => c.balance > 0).reduce((s, c) => s + c.balance, 0);
-      result = { clients: all.map(c => ({ name: c.name, type: c.type, balanceStr: formatBalance(c) })), totalDebt: `${totalDebt.toFixed(2)} GEL` };
-    } else if (name === "revenue_report") {
-      const rep = getRevenueReport(a.date_from, a.date_to);
-      result = { ...rep, message: `📊 Выручка: ${rep.revenue.toFixed(2)} GEL | Оплачено: ${rep.payments.toFixed(2)} GEL | Лотков: ${rep.totalLotki}` };
-    } else if (name === "add_expense") {
-      const exp = addExpense(a.date || today(), a.category, a.description, a.amount_gel);
-      result = { success: true, expense: exp, message: `✅ Расход ${a.amount_gel} GEL: ${a.description}` };
-    } else if (name === "partner_settlement") {
-      const s = calculatePartnerSettlement(a.date_from, a.date_to, a.natalia_share_pct || 50);
-      result = { ...s, message: `💼 Выручка: ${s.grossRevenue.toFixed(2)} GEL | Наталья: ${s.nataliaShare.toFixed(2)} GEL | Сергей: ${s.sergeiShare.toFixed(2)} GEL` };
-    } else if (name === "tax_monthly") {
-      const dateFrom = `${a.year}-${String(a.month).padStart(2,"0")}-01`;
-      const lastDay = new Date(a.year, a.month, 0).getDate();
-      const dateTo = `${a.year}-${String(a.month).padStart(2,"0")}-${lastDay}`;
-      const { revenue } = getRevenueReport(dateFrom, dateTo);
-      const tax = Math.round(revenue * 0.01 * 100) / 100;
-      result = { year: a.year, month: a.month, turnover: revenue, taxAmount: tax, message: `📋 Налог за ${a.month}/${a.year}: оборот ${revenue.toFixed(2)} GEL → налог ${tax.toFixed(2)} GEL (1%)` };
-    } else if (name === "lookup_tin") {
-      const n = await rsLookupTin(a.tin);
-      result = { tin: a.tin, name: n || "Не найдено" };
-    } else {
-      throw new Error(`Неизвестный инструмент: ${name}`);
+export function upsertClient(name: string, tin?: string, type = "horeca", phone?: string, notes?: string) {
+  if (tin) {
+    const existing = db.prepare("SELECT * FROM clients WHERE tin = ?").get(tin) as any;
+    if (existing) {
+      db.prepare("UPDATE clients SET name=?, type=?, phone=?, notes=? WHERE tin=?").run(name, type, phone || existing.phone, notes || existing.notes, tin);
+      return db.prepare("SELECT * FROM clients WHERE tin = ?").get(tin);
     }
-    return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
-  } catch (error: any) {
-    return { content: [{ type: "text", text: `❌ Ошибка: ${error.message}` }], isError: true };
   }
-});
-
-async function main() {
-  const transport = new StdioServerTransport();
-  await server.connect(transport);
-  console.error("✅ Microzelen MCP Server v2.0 запущен");
+  const r = db.prepare("INSERT INTO clients (name, tin, type, phone, notes) VALUES (?,?,?,?,?)").run(name, tin || null, type, phone || null, notes || null);
+  return db.prepare("SELECT * FROM clients WHERE id = ?").get(r.lastInsertRowid);
 }
-main().catch(console.error);
-    
-  
+
+export function getClient(nameOrTin: string) {
+  return db.prepare("SELECT * FROM clients WHERE tin = ? OR LOWER(name) LIKE LOWER(?)").get(nameOrTin, `%${nameOrTin}%`) as any;
+}
+
+export function listClients() {
+  return db.prepare("SELECT * FROM clients ORDER BY name").all() as any[];
+}
+
+export function addInvoice(clientId: number, date: string, items: any[], totalGel: number, rsWaybillId?: string, notes?: string) {
+  const r = db.prepare("INSERT INTO invoices (client_id, date, items, total_gel, rs_waybill_id, notes) VALUES (?,?,?,?,?,?)").run(clientId, date, JSON.stringify(items), totalGel, rsWaybillId || null, notes || null);
+  return db.prepare("SELECT * FROM invoices WHERE id = ?").get(r.lastInsertRowid) as any;
+}
+
+export function getClientInvoices(clientId: number, dateFrom?: string, dateTo?: string) {
+  let sql = "SELECT * FROM invoices WHERE client_id = ?";
+  const params: any[] = [clientId];
+  if (dateFrom) { sql += " AND date >= ?"; params.push(dateFrom); }
+  if (dateTo) { sql += " AND date <= ?"; params.push(dateTo); }
+  return db.prepare(sql + " ORDER BY date DESC").all(...params) as any[];
+}
+
+export function addPayment(clientId: number, amountGel: number, date: string, method = "transfer", notes?: string) {
+  const r = db.prepare("INSERT INTO payments (client_id, amount_gel, date, method, notes) VALUES (?,?,?,?,?)").run(clientId, amountGel, date, method, notes || null);
+  return db.prepare("SELECT * FROM payments WHERE id = ?").get(r.lastInsertRowid) as any;
+}
+
+export function getClientPayments(clientId: number, dateFrom?: string, dateTo?: string) {
+  let sql = "SELECT * FROM payments WHERE client_id = ?";
+  const params: any[] = [clientId];
+  if (dateFrom) { sql += " AND date >= ?"; params.push(dateFrom); }
+  if (dateTo) { sql += " AND date <= ?"; params.push(dateTo); }
+  return db.prepare(sql + " ORDER BY date DESC").all(...params) as any[];
+}
+
+export function getClientBalance(clientId: number) {
+  const invoiced = (db.prepare("SELECT COALESCE(SUM(total_gel),0) as t FROM invoices WHERE client_id = ? AND status != 'cancelled'").get(clientId) as any).t;
+  const paid = (db.prepare("SELECT COALESCE(SUM(amount_gel),0) as t FROM payments WHERE client_id = ?").get(clientId) as any).t;
+  return { invoiced, paid, balance: invoiced - paid };
+}
+
+export function getRevenueReport(dateFrom: string, dateTo: string) {
+  const revenue = (db.prepare("SELECT COALESCE(SUM(total_gel),0) as t FROM invoices WHERE date >= ? AND date <= ? AND status != 'cancelled'").get(dateFrom, dateTo) as any).t;
+  const payments = (db.prepare("SELECT COALESCE(SUM(amount_gel),0) as t FROM payments WHERE date >= ? AND date <= ?").get(dateFrom, dateTo) as any).t;
+  const rows = db.prepare("SELECT items FROM invoices WHERE date >= ? AND date <= ? AND status != 'cancelled'").all(dateFrom, dateTo) as any[];
+  let totalLotki = 0;
+  for (const row of rows) {
+    try { for (const i of JSON.parse(row.items)) totalLotki += i.quantity || 0; } catch {}
+  }
+  return { revenue, payments, totalLotki, dateFrom, dateTo };
+}
+
+export function getAllBalances() {
+  return listClients().map(c => ({ ...c, ...getClientBalance(c.id) })).filter(c => c.invoiced > 0 || c.paid > 0);
+}
+
+export function addExpense(date: string, category: string, description: string, amountGel: number, notes?: string) {
+  const r = db.prepare("INSERT INTO expenses (date, category, description, amount_gel, notes) VALUES (?,?,?,?,?)").run(date, category, description, amountGel, notes || null);
+  return db.prepare("SELECT * FROM expenses WHERE id = ?").get(r.lastInsertRowid) as any;
+}
+
+export function getExpenses(dateFrom?: string, dateTo?: string) {
+  let sql = "SELECT * FROM expenses WHERE 1=1";
+  const params: any[] = [];
+  if (dateFrom) { sql += " AND date >= ?"; params.push(dateFrom); }
+  if (dateTo) { sql += " AND date <= ?"; params.push(dateTo); }
+  return db.prepare(sql + " ORDER BY date DESC").all(...params) as any[];
+}
+
+export function calculatePartnerSettlement(dateFrom: string, dateTo: string, nataliaSharePct = 50) {
+  const { revenue } = getRevenueReport(dateFrom, dateTo);
+  const expenses = (db.prepare("SELECT COALESCE(SUM(amount_gel),0) as t FROM expenses WHERE date >= ? AND date <= ?").get(dateFrom, dateTo) as any).t;
+  const net = revenue - expenses;
+  return {
+    period: `${dateFrom} — ${dateTo}`,
+    grossRevenue: revenue,
+    expenses,
+    netProfit: net,
+    nataliaSharePct,
+    nataliaShare: net * nataliaSharePct / 100,
+    sergeiShare: net * (100 - nataliaSharePct) / 100
+  };
+}
  
