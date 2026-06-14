@@ -6,7 +6,7 @@ const http = require("http");
 const DATA_FILE = process.env.DB_PATH || "./data.json";
 const SELLER_TIN = process.env.SELLER_TIN || "345685902";
 const API_KEY = process.env.API_KEY || "";
-const WSDL = "http://services.rs.ge/WayBillService/WayBillService.asmx";
+const WSDL = "https://services.rs.ge/WayBillService/WayBillService.asmx";
 
 function loadData() {
   try { return JSON.parse(fs.readFileSync(DATA_FILE, "utf8")); }
@@ -42,6 +42,9 @@ const TOOLS = [
   { name: "add_expense", description: "Записать расход", input_schema: { type: "object", properties: { description: { type: "string" }, amount_gel: { type: "number" }, category: { type: "string" }, date: { type: "string" } }, required: ["description", "amount_gel", "category"] } },
   { name: "partner_settlement", description: "Расчёт с Натальей Шевченко", input_schema: { type: "object", properties: { date_from: { type: "string" }, date_to: { type: "string" } }, required: ["date_from", "date_to"] } },
   { name: "tax_monthly", description: "Налог за месяц 1%", input_schema: { type: "object", properties: { year: { type: "number" }, month: { type: "number" } }, required: ["year", "month"] } },
+  { name: "check_rs_connection", description: "Проверить IP-адрес сервера для rs.ge (what_is_my_ip)", input_schema: { type: "object", properties: {} } },
+  { name: "get_company_by_tin", description: "Узнать название компании по ИНН через rs.ge", input_schema: { type: "object", properties: { tin: { type: "string" } }, required: ["tin"] } },
+  { name: "verify_rs_credentials", description: "Проверить логин/пароль служебного пользователя rs.ge", input_schema: { type: "object", properties: {} } },
 ];
 
 async function executeTool(name, args) {
@@ -108,6 +111,35 @@ async function executeTool(name, args) {
     const revenue = data.invoices.filter(i => i.date >= df && i.date <= dt && i.status !== "cancelled").reduce((s, i) => s + i.total, 0);
     const tax = Math.round(revenue * 0.01 * 100) / 100;
     result = { turnover: revenue.toFixed(2), tax: tax.toFixed(2), message: `📋 Налог ${args.month}/${args.year}: оборот ${revenue.toFixed(2)} GEL → налог ${tax.toFixed(2)} GEL` };
+  } else if (name === "check_rs_connection") {
+    try {
+      const su = (process.env.RS_SERVICE_USER || "").split(":")[0];
+      const sp = process.env.RS_SERVICE_PASSWORD || "";
+      const body = await soapCall("what_is_my_ip", `<what_is_my_ip xmlns="http://tempuri.org/"><su>${su}</su><sp>${sp}</sp></what_is_my_ip>`);
+      const ip = body?.["what_is_my_ipResponse"]?.["what_is_my_ipResult"];
+      result = { success: true, ip, message: `🌐 IP сервера: ${ip}. Этот IP должен быть в белом списке служебного пользователя rs.ge.` };
+    } catch (e) {
+      result = { error: `Ошибка подключения к rs.ge: ${e.message}` };
+    }
+  } else if (name === "get_company_by_tin") {
+    try {
+      const su = (process.env.RS_SERVICE_USER || "").split(":")[0];
+      const sp = process.env.RS_SERVICE_PASSWORD || "";
+      const body = await soapCall("get_name_from_tin", `<get_name_from_tin xmlns="http://tempuri.org/"><su>${su}</su><sp>${sp}</sp><tin>${args.tin}</tin></get_name_from_tin>`);
+      const companyName = body?.["get_name_from_tinResponse"]?.["get_name_from_tinResult"];
+      result = { success: true, tin: args.tin, name: companyName, message: `🏢 ИНН ${args.tin}: ${companyName || "не найдено"}` };
+    } catch (e) {
+      result = { error: `Ошибка запроса к rs.ge: ${e.message}` };
+    }
+  } else if (name === "verify_rs_credentials") {
+    try {
+      const [su, sp_user] = (process.env.RS_SERVICE_USER || "").split(":");
+      const sp = process.env.RS_SERVICE_PASSWORD || "";
+      const body = await soapCall("get_service_users", `<get_service_users xmlns="http://tempuri.org/"><su>${su}:${sp_user}</su><sp>${sp}</sp></get_service_users>`);
+      result = { success: true, raw: body, message: `✅ Учётные данные приняты сервером rs.ge` };
+    } catch (e) {
+      result = { error: `Ошибка проверки учётных данных: ${e.message}` };
+    }
   } else {
     throw new Error(`Неизвестный инструмент: ${name}`);
   }
