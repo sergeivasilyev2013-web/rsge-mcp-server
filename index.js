@@ -164,7 +164,45 @@ function send(res, status, body) {
 
 const PORT = process.env.PORT || 8080;
 http.createServer(async (req, res) => {
-  if (req.method === "OPTIONS") { send(res, 200, {}); return; }
+ if (req.method === "GET" && req.url === "/debug-wsdl") {
+  try {
+    const axios = require("axios");
+    const { parseStringPromise } = require("xml2js");
+
+    const wsdlUrl = "https://services.rs.ge/WayBillService/WayBillService.asmx?wsdl";
+    const response = await axios.get(wsdlUrl, { timeout: 30000 });
+
+    const parsed = await parseStringPromise(response.data, { explicitArray: false });
+
+    const methods = [];
+    function findOperations(obj) {
+      if (!obj || typeof obj !== "object") return;
+      for (const key in obj) {
+        if (key.endsWith("operation") || key === "wsdl:operation") {
+          const ops = Array.isArray(obj[key]) ? obj[key] : [obj[key]];
+          for (const op of ops) {
+            if (op && op.$ && op.$.name) {
+              methods.push(op.$.name);
+            }
+          }
+        } else if (typeof obj[key] === "object") {
+          findOperations(obj[key]);
+        }
+      }
+    }
+    findOperations(parsed);
+
+    res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
+    res.end(JSON.stringify({
+      wsdlUrl,
+      availableMethods: [...new Set(methods)],
+    }, null, 2));
+  } catch (error) {
+    res.writeHead(500, { "Content-Type": "application/json; charset=utf-8" });
+    res.end(JSON.stringify({ error: error.message }, null, 2));
+  }
+  return;
+} if (req.method === "OPTIONS") { send(res, 200, {}); return; }
 
   if (req.url === "/" && req.method === "GET") {
     res.writeHead(200, { "Content-Type": "text/plain" });
