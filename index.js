@@ -45,7 +45,11 @@ const TOOLS = [
   { name: "check_rs_connection", description: "Проверить IP-адрес сервера для rs.ge (what_is_my_ip)", input_schema: { type: "object", properties: {} } },
   { name: "get_company_by_tin", description: "Узнать название компании по ИНН через rs.ge", input_schema: { type: "object", properties: { tin: { type: "string" } }, required: ["tin"] } },
   { name: "verify_rs_credentials", description: "Проверить логин/пароль служебного пользователя rs.ge", input_schema: { type: "object", properties: {} } },
-];const axios = require("axios");
+const axios = require("axios");
+const xml2js = require("xml2js");
+const fs = require("fs");
+const http = require("http");
+const soap = require("soap"); // если используете
 const xml2js = require("xml2js");
 const fs = require("fs");
 const http = require("http");
