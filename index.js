@@ -94,7 +94,16 @@ const TOOLS = [
   { name: "verify_rs_credentials", description: "Проверить логин/пароль служебного пользователя rs.ge", input_schema: { type: "object", properties: {} } },
 ];
 
-async function executeTool(name, args) {
+async function executeTool(name, args) {} else if (name === "create_service_user") {
+    try {
+      const bodyXml = `<create_service_user xmlns="http://tempuri.org/"><username>${args.rs_username}</username><password>${args.rs_password}</password><ip>${args.ip}</ip><name>${args.description || "Microzelen Railway Service"}</name><su>${args.new_su}</su><sp>${args.new_sp}</sp></create_service_user>`;
+      const body = await soapCall("create_service_user", bodyXml);
+      const response = body?.["create_service_userResponse"]?.["create_service_userResult"];
+      result = { success: true, raw: response, new_su: args.new_su, message: `Результат: ${JSON.stringify(response)}` };
+    } catch (e) {
+      result = { error: `Ошибка создания служебного пользователя: ${e.message}` };
+    }
+  }
   args = args || {};
   const data = loadData();
   let result;
