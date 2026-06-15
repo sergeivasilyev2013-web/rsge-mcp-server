@@ -118,7 +118,7 @@ async function executeTool(name, args) {
       const sp = process.env.RS_SERVICE_PASSWORD || "";
       const body = await soapCall("what_is_my_ip", `<what_is_my_ip xmlns="http://tempuri.org/"><su>${su}</su><sp>${sp}</sp></what_is_my_ip>`);
       const ip = body?.["what_is_my_ipResponse"]?.["what_is_my_ipResult"];
-< truncated line 121 >
+      result = { success: true, ip, message: `🌐 IP сервера: ${ip}. Этот IP должен быть в белом списке служебного пользователя rs.ge.` };
     } catch (e) {
       result = { error: `Ошибка подключения к rs.ge: ${e.message}` };
     }
@@ -237,4 +237,4 @@ http.createServer(async (req, res) => {
   }
 
   send(res, 404, { error: "Not found" });
-}).listen(PORT, () => console.error(`Server on port ${PORT}`));     
+}).listen(PORT, () => console.error(`Server on port ${PORT}`));
