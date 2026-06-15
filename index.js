@@ -114,7 +114,7 @@ async function executeTool(name, args) {
     result = { turnover: revenue.toFixed(2), tax: tax.toFixed(2), message: `📋 Налог ${args.month}/${args.year}: оборот ${revenue.toFixed(2)} GEL → налог ${tax.toFixed(2)} GEL` };
   } else if (name === "check_rs_connection") {
     try {
-      const su = (process.env.RS_SERVICE_USER || "").split(":")[0];
+      const su = process.env.RS_SERVICE_USER || "";
       const sp = process.env.RS_SERVICE_PASSWORD || "";
       const body = await soapCall("what_is_my_ip", `<what_is_my_ip xmlns="http://tempuri.org/"><su>${su}</su><sp>${sp}</sp></what_is_my_ip>`);
       const ip = body?.["what_is_my_ipResponse"]?.["what_is_my_ipResult"];
@@ -124,11 +124,11 @@ async function executeTool(name, args) {
     }
   } else if (name === "get_company_by_tin") {
     try {
-      const su = (process.env.RS_SERVICE_USER || "").split(":")[0];
+      const su = process.env.RS_SERVICE_USER || "";
       const sp = process.env.RS_SERVICE_PASSWORD || "";
       const body = await soapCall("get_name_from_tin", `<get_name_from_tin xmlns="http://tempuri.org/"><su>${su}</su><sp>${sp}</sp><tin>${args.tin}</tin></get_name_from_tin>`);
       const companyName = body?.["get_name_from_tinResponse"]?.["get_name_from_tinResult"];
-      result = { success: true, tin: args.tin, name: companyName, message: `🏢 ИНН ${args.tin}: ${companyName || "не найдено"}` };
+      result = { success: true, tin: args.tin, name: companyName, raw: body, request_su: su, message: `🏢 ИНН ${args.tin}: ${companyName || "не найдено"}` };
     } catch (e) {
       result = { error: `Ошибка запроса к rs.ge: ${e.message}` };
     }
