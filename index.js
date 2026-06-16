@@ -7,6 +7,7 @@ const DATA_FILE = process.env.DB_PATH || "./data.json";
 const SELLER_TIN = process.env.SELLER_TIN || "345685902";
 const API_KEY = process.env.API_KEY || "";
 const WSDL = "https://services.rs.ge/WayBillService/WayBillService.asmx";
+const TAXPAYER_WSDL = "https://services.rs.ge/taxservice/taxpayerservice.asmx";
 
 function loadData() {
   try { return JSON.parse(fs.readFileSync(DATA_FILE, "utf8")); }
@@ -30,6 +31,13 @@ async function soapCall(action, bodyXml) {
   const parsed = await xml2js.parseStringPromise(r.data, { explicitArray: false });
   return parsed["soap:Envelope"]["soap:Body"];
 }
+// Отдельная функция для сервиса taxpayerservice.asmx — другой namespace и SOAPAction
+async function soapCallTaxpayer(action, bodyXml) {
+  const envelope = `<?xml version="1.0" encoding="utf-8"?><soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/"><soap:Body>${bodyXml}</soap:Body></soap:Envelope>`;
+  const r = await axios.post(TAXPAYER_WSDL, envelope, { headers: { "Content-Type": "text/xml; charset=utf-8", "SOAPAction": `services.rs.ge/${action}` }, timeout: 30000 });
+  const parsed = await xml2js.parseStringPromise(r.data, { explicitArray: false });
+  return parsed["soap:Envelope"]["soap:Body"];
+}
 
 const TOOLS = [
   { name: "add_client", description: "Добавить клиента (horeca/private/wholesale)", input_schema: { type: "object", properties: { name: { type: "string" }, tin: { type: "string" }, type: { type: "string" }, phone: { type: "string" } }, required: ["name"] } },
@@ -43,7 +51,7 @@ const TOOLS = [
   { name: "partner_settlement", description: "Расчёт с Натальей Шевченко", input_schema: { type: "object", properties: { date_from: { type: "string" }, date_to: { type: "string" } }, required: ["date_from", "date_to"] } },
   { name: "tax_monthly", description: "Налог за месяц 1%", input_schema: { type: "object", properties: { year: { type: "number" }, month: { type: "number" } }, required: ["year", "month"] } },
   { name: "check_rs_connection", description: "Проверить IP-адрес сервера для rs.ge (what_is_my_ip)", input_schema: { type: "object", properties: {} } },
-  { name: "get_company_by_tin", description: "Узнать название компании по ИНН через rs.ge", input_schema: { type: "object", properties: { tin: { type: "string" } }, required: ["tin"] } },
+  { name: "get_company_by_tin", description: "Узнать название компании по ИНН через rs.ge (GetTPInfoPublic)", input_schema: { type: "object", properties: { tin: { type: "string" } }, required: ["tin"] } },
   { name: "verify_rs_credentials", description: "Проверить логин/пароль служебного пользователя rs.ge", input_schema: { type: "object", properties: {} } },
   { name: "create_service_user", description: "Создать нового служебного пользователя rs.ge (su/sp) для программного доступа к API. Требует основной логин/пароль от rs.ge.", input_schema: { type: "object", properties: { rs_username: { type: "string" }, rs_password: { type: "string" }, ip: { type: "string" }, new_su: { type: "string" }, new_sp: { type: "string" }, description: { type: "string" } }, required: ["rs_username", "rs_password", "ip", "new_su", "new_sp"] } },
 ];
@@ -123,14 +131,30 @@ async function executeTool(name, args) {
       result = { error: `Ошибка подключения к rs.ge: ${e.message}` };
     }
   } else if (name === "get_company_by_tin") {
+    // Используем GetTPInfoPublic из сервиса taxpayerservice.asmx (другой namespace/сервис, не WayBillService)
     try {
       const su = process.env.RS_SERVICE_USER || "";
       const sp = process.env.RS_SERVICE_PASSWORD || "";
-      const body = await soapCall("get_name_from_tin", `<get_name_from_tin xmlns="http://tempuri.org/"><su>${su}</su><sp>${sp}</sp><tin>${args.tin}</tin></get_name_from_tin>`);
-      const companyName = body?.["get_name_from_tinResponse"]?.["get_name_from_tinResult"];
-      result = { success: true, tin: args.tin, name: companyName, raw: body, request_su: su, message: `🏢 ИНН ${args.tin}: ${companyName || "не найдено"}` };
+      const bodyXml = `<GetTPInfoPublic xmlns="services.rs.ge"><Username>${su}</Username><Password>${sp}</Password><TP_Code>${args.tin}</TP_Code></GetTPInfoPublic>`;
+      const body = await soapCallTaxpayer("GetTPInfoPublic", bodyXml);
+      const respResult = body?.["GetTPInfoPublicResponse"]?.["GetTPInfoPublicResult"];
+      const info = respResult?.["TPInfoPublic"];
+      const status = respResult?.["Response"];
+      const companyName = info?.["TP_Name"];
+      result = {
+        success: true,
+        tin: args.tin,
+        name: companyName || null,
+        status: info?.["TP_Status"] || null,
+        legalForm: info?.["TP_LegalForm"] || null,
+        address: info?.["TP_Address"] || null,
+        responseStatus: status,
+        raw: body,
+        request_su: su,
+        message: companyName ? `🏢 ИНН ${args.tin}: ${companyName} (${info?.["TP_Status"] || "?"})` : `🏢 ИНН ${args.tin}: не найдено`
+      };
     } catch (e) {
-      result = { error: `Ошибка запроса к rs.ge: ${e.message}` };
+      result = { error: `Ошибка запроса к rs.ge (GetTPInfoPublic): ${e.message}` };
     }
   } else if (name === "verify_rs_credentials") {
     try {
