@@ -1,6 +1,6 @@
 const http = require('http');
 const fs = require('fs');
-const querystring = require('querystring');
+const crypto = require('crypto');
 
 // --- Загрузка кредов служебного пользователя ---
 function loadCredentials() {
@@ -12,7 +12,6 @@ function loadCredentials() {
     }
 }
 
-// --- Сохранение кредов (если нужно) ---
 function saveCredentials(creds) {
     fs.writeFileSync('./credentials.json', JSON.stringify(creds, null, 2));
 }
@@ -30,7 +29,7 @@ function getCurrentIP() {
     });
 }
 
-// --- Создание служебного пользователя (SOAP) ---
+// --- Создание служебного пользователя ---
 async function createServiceUser(masterSu, masterSp, ip, newSu, newSp) {
     const soapBody = `<?xml version="1.0" encoding="utf-8"?>
 <soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
@@ -85,7 +84,7 @@ async function ensureCredentials() {
     }
 
     const newSu = 'sergei_' + Date.now().toString(36);
-    const newSp = require('crypto').randomBytes(10).toString('hex');
+    const newSp = crypto.randomBytes(10).toString('hex');
     console.log(`🔄 Создаём нового пользователя: ${newSu} для IP ${currentIP}`);
     await createServiceUser(masterSu, masterSp, currentIP, newSu, newSp);
     const newCreds = { ip: currentIP, su: newSu, sp: newSp };
@@ -94,7 +93,7 @@ async function ensureCredentials() {
     return newCreds;
 }
 
-// --- Публичный метод GetTPInfoPublic (для проверки ИНН) ---
+// --- Публичный метод GetTPInfoPublic (проверка ИНН) ---
 async function getCompanyByTinPublic(tin) {
     const soapBody = `<?xml version="1.0" encoding="utf-8"?>
 <soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
@@ -136,25 +135,46 @@ async function getCompanyByTinPublic(tin) {
     });
 }
 
-// --- СОЗДАНИЕ НАКЛАДНОЙ (метод add_invoice или save_waybill) ---
+// --- СОЗДАНИЕ НАКЛАДНОЙ (save_waybill) ---
 async function createInvoice(data) {
     const creds = loadCredentials();
     if (!creds) throw new Error('Нет служебного пользователя');
     const { su, sp } = creds;
+    const sellerTin = process.env.SELLER_TIN || '345685902';
 
-    // data должен содержать: buyerTin, total, description (опционально), items (массив)
-    // Для простоты используем базовый запрос
+    // Если товары не переданы, создаём один товар по умолчанию
+    const items = data.items || [{
+        name: data.description || 'Микрозелень',
+        code: data.productCode || '55000005',
+        quantity: data.quantity || 1,
+        price: data.total || data.totalAmount || 0
+    }];
+
+    // Формируем XML для каждого товара
+    const itemsXml = items.map(item => `
+        <item>
+            <productName>${item.name}</productName>
+            <productCode>${item.code || '55000005'}</productCode>
+            <quantity>${item.quantity || 1}</quantity>
+            <unitPrice>${item.price || item.unitPrice || 0}</unitPrice>
+            <totalPrice>${(item.quantity || 1) * (item.price || item.unitPrice || 0)}</totalPrice>
+        </item>
+    `).join('');
+
+    const totalAmount = items.reduce((sum, item) => sum + (item.quantity || 1) * (item.price || item.unitPrice || 0), 0);
+
     const soapBody = `<?xml version="1.0" encoding="utf-8"?>
 <soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
   <soap:Body>
-    <add_invoice xmlns="http://tempuri.org/">
+    <save_waybill xmlns="http://tempuri.org/">
       <su>${su}</su>
       <sp>${sp}</sp>
+      <sellerTin>${sellerTin}</sellerTin>
       <buyerTin>${data.buyerTin}</buyerTin>
-      <total>${data.total}</total>
+      <totalAmount>${totalAmount}</totalAmount>
+      <items>${itemsXml}</items>
       <description>${data.description || ''}</description>
-      <items>${data.items ? JSON.stringify(data.items) : ''}</items>
-    </add_invoice>
+    </save_waybill>
   </soap:Body>
 </soap:Envelope>`;
 
@@ -164,7 +184,7 @@ async function createInvoice(data) {
         method: 'POST',
         headers: {
             'Content-Type': 'text/xml; charset=utf-8',
-            'SOAPAction': 'http://tempuri.org/add_invoice',
+            'SOAPAction': 'http://tempuri.org/save_waybill',
             'Content-Length': Buffer.byteLength(soapBody)
         }
     };
@@ -173,7 +193,14 @@ async function createInvoice(data) {
         const req = http.request(options, (res) => {
             let data = '';
             res.on('data', chunk => data += chunk);
-            res.on('end', () => resolve(data));
+            res.on('end', () => {
+                const idMatch = data.match(/<waybillId>([^<]*)<\/waybillId>/);
+                resolve({
+                    success: true,
+                    waybillId: idMatch ? idMatch[1] : 'неизвестен',
+                    raw: data
+                });
+            });
         });
         req.on('error', reject);
         req.write(soapBody);
@@ -181,13 +208,12 @@ async function createInvoice(data) {
     });
 }
 
-// --- РЕГИСТРАЦИЯ ОПЛАТЫ (метод update_invoice_status или add_payment) ---
+// --- РЕГИСТРАЦИЯ ОПЛАТЫ (update_invoice_status) ---
 async function recordPayment(data) {
     const creds = loadCredentials();
     if (!creds) throw new Error('Нет служебного пользователя');
     const { su, sp } = creds;
 
-    // data: invoiceId, amount, paymentDate
     const soapBody = `<?xml version="1.0" encoding="utf-8"?>
 <soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
   <soap:Body>
@@ -217,7 +243,7 @@ async function recordPayment(data) {
         const req = http.request(options, (res) => {
             let data = '';
             res.on('data', chunk => data += chunk);
-            res.on('end', () => resolve(data));
+            res.on('end', () => resolve({ success: true, raw: data }));
         });
         req.on('error', reject);
         req.write(soapBody);
@@ -251,15 +277,27 @@ const server = http.createServer((req, res) => {
                 },
                 {
                     name: "create_invoice",
-                    description: "Создать накладную в rs.ge",
+                    description: "Создать накладную в rs.ge (по образцу)",
                     input_schema: {
                         type: "object",
                         properties: {
-                            buyerTin: { type: "string", description: "ИНН покупателя" },
-                            total: { type: "number", description: "Сумма в лари" },
-                            description: { type: "string", description: "Описание (необязательно)" }
+                            buyerTin: { type: "string", description: "ИНН покупателя (11 цифр)" },
+                            total: { type: "number", description: "Сумма в лари (если нет товаров)" },
+                            description: { type: "string", description: "Описание (например, заказ от...)" },
+                            items: {
+                                type: "array",
+                                description: "Массив товаров (можно передать один)",
+                                items: {
+                                    type: "object",
+                                    properties: {
+                                        name: { type: "string", description: "Название товара" },
+                                        price: { type: "number", description: "Цена за единицу" },
+                                        quantity: { type: "number", description: "Количество" }
+                                    }
+                                }
+                            }
                         },
-                        required: ["buyerTin", "total"]
+                        required: ["buyerTin"]
                     }
                 },
                 {
@@ -268,7 +306,7 @@ const server = http.createServer((req, res) => {
                     input_schema: {
                         type: "object",
                         properties: {
-                            invoiceId: { type: "string", description: "ID накладной" },
+                            invoiceId: { type: "string", description: "ID накладной (из ответа create_invoice)" },
                             amount: { type: "number", description: "Сумма оплаты" }
                         },
                         required: ["invoiceId", "amount"]
@@ -294,16 +332,28 @@ const server = http.createServer((req, res) => {
                     result = await getCompanyByTinPublic(tin);
                 } else if (tool === 'create_invoice') {
                     const buyerTin = args.buyerTin;
-                    const total = args.total;
-                    if (!buyerTin || !total) throw new Error('Не хватает данных (buyerTin, total)');
-                    const response = await createInvoice({ buyerTin, total, description: args.description });
-                    result = { success: true, raw: response };
+                    if (!buyerTin) throw new Error('Не указан ИНН покупателя');
+                    // Если передана сумма без товаров — создаём один товар
+                    if (args.total && !args.items) {
+                        args.items = [{
+                            name: args.description || 'Микрозелень',
+                            price: args.total,
+                            quantity: 1
+                        }];
+                    }
+                    const response = await createInvoice({
+                        buyerTin,
+                        total: args.total,
+                        description: args.description,
+                        items: args.items
+                    });
+                    result = response;
                 } else if (tool === 'record_payment') {
                     const invoiceId = args.invoiceId;
                     const amount = args.amount;
                     if (!invoiceId || !amount) throw new Error('Не хватает данных (invoiceId, amount)');
                     const response = await recordPayment({ invoiceId, amount });
-                    result = { success: true, raw: response };
+                    result = response;
                 } else {
                     throw new Error(`Неизвестный инструмент: ${tool}`);
                 }
