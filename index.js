@@ -1,5 +1,6 @@
 const http = require('http');
 const fs = require('fs');
+const querystring = require('querystring');
 
 // --- Загрузка кредов служебного пользователя ---
 function loadCredentials() {
@@ -11,85 +12,89 @@ function loadCredentials() {
     }
 }
 
-const server = http.createServer((req, res) => {
-    res.setHeader('Content-Type', 'application/json');
-    res.setHeader('Access-Control-Allow-Origin', '*');
+// --- Сохранение кредов (если нужно) ---
+function saveCredentials(creds) {
+    fs.writeFileSync('./credentials.json', JSON.stringify(creds, null, 2));
+}
 
-    // --- /ping ---
-    if (req.url === '/ping' && req.method === 'GET') {
-        res.end(JSON.stringify({ status: 'ok' }));
-        return;
-    }
-
-    // --- /tools ---
-    if (req.url === '/tools' && req.method === 'GET') {
-        res.end(JSON.stringify({
-            tools: [
-                {
-                    name: "get_company_by_tin",
-                    description: "Найти компанию по ИНН (публичный метод)",
-                    input_schema: {
-                        type: "object",
-                        properties: {
-                            tin: { type: "string", description: "11 цифр ИНН" }
-                        },
-                        required: ["tin"]
-                    }
-                },
-                {
-                    name: "get_name_from_tin",
-                    description: "Получить название компании по ИНН (авторизованный метод)",
-                    input_schema: {
-                        type: "object",
-                        properties: {
-                            tin: { type: "string", description: "11 цифр ИНН" }
-                        },
-                        required: ["tin"]
-                    }
-                }
-            ]
-        }));
-        return;
-    }
-
-    // --- /execute ---
-    if (req.url === '/execute' && req.method === 'POST') {
-        let body = '';
-        req.on('data', chunk => body += chunk);
-        req.on('end', async () => {
-            try {
-                const data = JSON.parse(body);
-                const { tool, arguments: args } = data;
-                let result;
-
-                if (tool === 'get_company_by_tin') {
-                    const tin = args.tin;
-                    if (!tin) throw new Error('Не указан ИНН');
-                    result = await getCompanyByTinPublic(tin);
-                } else if (tool === 'get_name_from_tin') {
-                    const tin = args.tin;
-                    if (!tin) throw new Error('Не указан ИНН');
-                    const creds = loadCredentials();
-                    if (!creds) throw new Error('Нет сохранённых кредов');
-                    result = await getCompanyNameByTin(tin, creds.su, creds.sp);
-                } else {
-                    throw new Error(`Неизвестный инструмент: ${tool}`);
-                }
-
-                res.end(JSON.stringify({ result: { success: true, data: result } }));
-            } catch (err) {
-                res.statusCode = 500;
-                res.end(JSON.stringify({ error: err.message }));
-            }
+// --- Получение текущего IP ---
+function getCurrentIP() {
+    return new Promise((resolve, reject) => {
+        const req = http.get('http://ifconfig.me/ip', (res) => {
+            let data = '';
+            res.on('data', chunk => data += chunk);
+            res.on('end', () => resolve(data.trim()));
         });
-        return;
+        req.on('error', reject);
+        req.end();
+    });
+}
+
+// --- Создание служебного пользователя (SOAP) ---
+async function createServiceUser(masterSu, masterSp, ip, newSu, newSp) {
+    const soapBody = `<?xml version="1.0" encoding="utf-8"?>
+<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
+  <soap:Body>
+    <create_service_user xmlns="http://tempuri.org/">
+      <username>${masterSu}</username>
+      <password>${masterSp}</password>
+      <ip>${ip}</ip>
+      <name>MicrozelenAuto</name>
+      <su>${newSu}</su>
+      <sp>${newSp}</sp>
+    </create_service_user>
+  </soap:Body>
+</soap:Envelope>`;
+
+    const options = {
+        hostname: 'services.rs.ge',
+        path: '/WayBillService/WayBillService.asmx',
+        method: 'POST',
+        headers: {
+            'Content-Type': 'text/xml; charset=utf-8',
+            'SOAPAction': 'http://tempuri.org/create_service_user',
+            'Content-Length': Buffer.byteLength(soapBody)
+        }
+    };
+
+    return new Promise((resolve, reject) => {
+        const req = http.request(options, (res) => {
+            let data = '';
+            res.on('data', chunk => data += chunk);
+            res.on('end', () => resolve(data));
+        });
+        req.on('error', reject);
+        req.write(soapBody);
+        req.end();
+    });
+}
+
+// --- Автоматическая проверка/создание кредов ---
+async function ensureCredentials() {
+    let creds = loadCredentials();
+    const currentIP = await getCurrentIP();
+    if (creds && creds.ip === currentIP) {
+        console.log(`✅ IP стабилен (${currentIP}), используем ${creds.su}`);
+        return creds;
     }
 
-    res.statusCode = 404;
-    res.end(JSON.stringify({ error: 'Not found' }));
-});
+    const masterSu = process.env.MASTER_SU;
+    const masterSp = process.env.MASTER_SP;
+    if (!masterSu || !masterSp) {
+        throw new Error('MASTER_SU и MASTER_SP не заданы в переменных окружения');
+    }
 
-// --- Публичный метод GetTPInfoPublic ---
+    const newSu = 'sergei_' + Date.now().toString(36);
+    const newSp = require('crypto').randomBytes(10).toString('hex');
+    console.log(`🔄 Создаём нового пользователя: ${newSu} для IP ${currentIP}`);
+    await createServiceUser(masterSu, masterSp, currentIP, newSu, newSp);
+    const newCreds = { ip: currentIP, su: newSu, sp: newSp };
+    saveCredentials(newCreds);
+    console.log(`✅ Пользователь ${newSu} сохранён.`);
+    return newCreds;
+}
+
+// --- Публичный метод GetTPInfoPublic (для проверки ИНН) ---
 async function getCompanyByTinPublic(tin) {
     const soapBody = `<?xml version="1.0" encoding="utf-8"?>
 <soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
@@ -131,16 +136,25 @@ async function getCompanyByTinPublic(tin) {
     });
 }
 
-// --- Авторизованный метод get_name_from_tin ---
-async function getCompanyNameByTin(tin, su, sp) {
+// --- СОЗДАНИЕ НАКЛАДНОЙ (метод add_invoice или save_waybill) ---
+async function createInvoice(data) {
+    const creds = loadCredentials();
+    if (!creds) throw new Error('Нет служебного пользователя');
+    const { su, sp } = creds;
+
+    // data должен содержать: buyerTin, total, description (опционально), items (массив)
+    // Для простоты используем базовый запрос
     const soapBody = `<?xml version="1.0" encoding="utf-8"?>
 <soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
   <soap:Body>
-    <get_name_from_tin xmlns="http://tempuri.org/">
+    <add_invoice xmlns="http://tempuri.org/">
       <su>${su}</su>
       <sp>${sp}</sp>
-      <tin>${tin}</tin>
-    </get_name_from_tin>
+      <buyerTin>${data.buyerTin}</buyerTin>
+      <total>${data.total}</total>
+      <description>${data.description || ''}</description>
+      <items>${data.items ? JSON.stringify(data.items) : ''}</items>
+    </add_invoice>
   </soap:Body>
 </soap:Envelope>`;
 
@@ -150,7 +164,7 @@ async function getCompanyNameByTin(tin, su, sp) {
         method: 'POST',
         headers: {
             'Content-Type': 'text/xml; charset=utf-8',
-            'SOAPAction': 'http://tempuri.org/get_name_from_tin',
+            'SOAPAction': 'http://tempuri.org/add_invoice',
             'Content-Length': Buffer.byteLength(soapBody)
         }
     };
@@ -159,13 +173,7 @@ async function getCompanyNameByTin(tin, su, sp) {
         const req = http.request(options, (res) => {
             let data = '';
             res.on('data', chunk => data += chunk);
-            res.on('end', () => {
-                const nameMatch = data.match(/<get_name_from_tinResult>([^<]*)<\/get_name_from_tinResult>/);
-                resolve({
-                    tin: tin,
-                    name: nameMatch ? nameMatch[1] : 'Не найдено'
-                });
-            });
+            res.on('end', () => resolve(data));
         });
         req.on('error', reject);
         req.write(soapBody);
@@ -173,7 +181,161 @@ async function getCompanyNameByTin(tin, su, sp) {
     });
 }
 
-const PORT = process.env.PORT || 8080;
-server.listen(PORT, () => {
-    console.log(`✅ Сервер запущен на порту ${PORT}`);
+// --- РЕГИСТРАЦИЯ ОПЛАТЫ (метод update_invoice_status или add_payment) ---
+async function recordPayment(data) {
+    const creds = loadCredentials();
+    if (!creds) throw new Error('Нет служебного пользователя');
+    const { su, sp } = creds;
+
+    // data: invoiceId, amount, paymentDate
+    const soapBody = `<?xml version="1.0" encoding="utf-8"?>
+<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
+  <soap:Body>
+    <update_invoice_status xmlns="http://tempuri.org/">
+      <su>${su}</su>
+      <sp>${sp}</sp>
+      <invoiceId>${data.invoiceId}</invoiceId>
+      <status>paid</status>
+      <amount>${data.amount}</amount>
+      <paymentDate>${data.paymentDate || new Date().toISOString().slice(0,10)}</paymentDate>
+    </update_invoice_status>
+  </soap:Body>
+</soap:Envelope>`;
+
+    const options = {
+        hostname: 'services.rs.ge',
+        path: '/WayBillService/WayBillService.asmx',
+        method: 'POST',
+        headers: {
+            'Content-Type': 'text/xml; charset=utf-8',
+            'SOAPAction': 'http://tempuri.org/update_invoice_status',
+            'Content-Length': Buffer.byteLength(soapBody)
+        }
+    };
+
+    return new Promise((resolve, reject) => {
+        const req = http.request(options, (res) => {
+            let data = '';
+            res.on('data', chunk => data += chunk);
+            res.on('end', () => resolve(data));
+        });
+        req.on('error', reject);
+        req.write(soapBody);
+        req.end();
+    });
+}
+
+// --- HTTP сервер ---
+const server = http.createServer((req, res) => {
+    res.setHeader('Content-Type', 'application/json');
+    res.setHeader('Access-Control-Allow-Origin', '*');
+
+    if (req.url === '/ping' && req.method === 'GET') {
+        res.end(JSON.stringify({ status: 'ok' }));
+        return;
+    }
+
+    if (req.url === '/tools' && req.method === 'GET') {
+        res.end(JSON.stringify({
+            tools: [
+                {
+                    name: "get_company_by_tin",
+                    description: "Проверить ИНН (публичный метод)",
+                    input_schema: {
+                        type: "object",
+                        properties: {
+                            tin: { type: "string", description: "11 цифр ИНН" }
+                        },
+                        required: ["tin"]
+                    }
+                },
+                {
+                    name: "create_invoice",
+                    description: "Создать накладную в rs.ge",
+                    input_schema: {
+                        type: "object",
+                        properties: {
+                            buyerTin: { type: "string", description: "ИНН покупателя" },
+                            total: { type: "number", description: "Сумма в лари" },
+                            description: { type: "string", description: "Описание (необязательно)" }
+                        },
+                        required: ["buyerTin", "total"]
+                    }
+                },
+                {
+                    name: "record_payment",
+                    description: "Зарегистрировать оплату по накладной",
+                    input_schema: {
+                        type: "object",
+                        properties: {
+                            invoiceId: { type: "string", description: "ID накладной" },
+                            amount: { type: "number", description: "Сумма оплаты" }
+                        },
+                        required: ["invoiceId", "amount"]
+                    }
+                }
+            ]
+        }));
+        return;
+    }
+
+    if (req.url === '/execute' && req.method === 'POST') {
+        let body = '';
+        req.on('data', chunk => body += chunk);
+        req.on('end', async () => {
+            try {
+                const data = JSON.parse(body);
+                const { tool, arguments: args } = data;
+                let result;
+
+                if (tool === 'get_company_by_tin') {
+                    const tin = args.tin;
+                    if (!tin) throw new Error('Не указан ИНН');
+                    result = await getCompanyByTinPublic(tin);
+                } else if (tool === 'create_invoice') {
+                    const buyerTin = args.buyerTin;
+                    const total = args.total;
+                    if (!buyerTin || !total) throw new Error('Не хватает данных (buyerTin, total)');
+                    const response = await createInvoice({ buyerTin, total, description: args.description });
+                    result = { success: true, raw: response };
+                } else if (tool === 'record_payment') {
+                    const invoiceId = args.invoiceId;
+                    const amount = args.amount;
+                    if (!invoiceId || !amount) throw new Error('Не хватает данных (invoiceId, amount)');
+                    const response = await recordPayment({ invoiceId, amount });
+                    result = { success: true, raw: response };
+                } else {
+                    throw new Error(`Неизвестный инструмент: ${tool}`);
+                }
+
+                res.end(JSON.stringify({ result: { success: true, data: result } }));
+            } catch (err) {
+                res.statusCode = 500;
+                res.end(JSON.stringify({ error: err.message }));
+            }
+        });
+        return;
+    }
+
+    res.statusCode = 404;
+    res.end(JSON.stringify({ error: 'Not found' }));
 });
+
+// --- Запуск ---
+const PORT = process.env.PORT || 8080;
+
+async function start() {
+    try {
+        const creds = await ensureCredentials();
+        global.RS_CREDS = creds;
+        server.listen(PORT, () => {
+            console.log(`🚀 Сервер запущен на порту ${PORT}`);
+            console.log(`🔑 Используется служебный пользователь: ${creds.su}`);
+        });
+    } catch (err) {
+        console.error('❌ Ошибка инициализации:', err.message);
+        process.exit(1);
+    }
+}
+
+start();
